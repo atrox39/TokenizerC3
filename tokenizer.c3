@@ -3,6 +3,9 @@ module tokenizer;
 const ushort MAX_TOKENS = 4096; 
 ushort[MAX_TOKENS] token_output;
 
+// A dedicated safe memory buffer for JavaScript to write into
+char[MAX_TOKENS] input_buffer; 
+
 /**
  * Safely compares two text strings in memory.
  */
@@ -17,8 +20,9 @@ fn bool strings_match(char* a, char* b, int len)
 
 /**
  * High-performance universal tokenizer for LLM prompts and source code.
+ * FIX: @export prevents dead-code elimination and exposes it publicly during linking.
  */
-fn int tokenize_input_text(char* text_ptr, int text_len) @wasm("tokenize_input_text")
+fn int tokenize_input_text(char* text_ptr, int text_len) @export @wasm("tokenize_input_text")
 {
     if (text_len <= 0 || text_len > MAX_TOKENS) return 0;
 
@@ -169,7 +173,14 @@ fn int tokenize_input_text(char* text_ptr, int text_len) @wasm("tokenize_input_t
     return token_count;
 }
 
-fn ushort* get_token_output_pointer() @wasm("get_token_output_pointer")
+// FIX: @export prevents DCE
+fn ushort* get_token_output_pointer() @export @wasm("get_token_output_pointer")
 {
     return &token_output;
+}
+
+// FIX: @export prevents DCE
+fn char* get_input_pointer() @export @wasm("get_input_pointer")
+{
+    return &input_buffer;
 }
