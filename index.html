@@ -1,0 +1,242 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>LLM Prompt Budget Optimizer (C3 + WASM)</title>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; max-width: 1000px; margin: 40px auto; padding: 20px; background: #fdfdfd; color: #222; }
+    .grid { display: grid; grid-template-columns: 2fr 1fr; gap: 20px; margin-top: 20px; }
+    textarea { width: 100%; height: 240px; font-family: monospace; padding: 12px; box-sizing: border-box; border: 1px solid #ccc; border-radius: 6px; font-size: 14px; background: #fff; }
+    .panel { background: #fff; border: 1px solid #e1e4e8; padding: 20px; border-radius: 6px; box-shadow: 0 2px 4px rgba(0,0,0,0.02); display: flex; flex-direction: column; justify-content: space-between; }
+    .control-group { margin-bottom: 12px; }
+    label { display: block; font-weight: 600; margin-bottom: 5px; font-size: 14px; }
+    select, input { width: 100%; padding: 8px; border: 1px solid #ccc; border-radius: 4px; box-sizing: border-box; }
+    .btn-group { display: flex; gap: 10px; margin-top: 15px; }
+    button { color: white; border: none; padding: 12px 15px; border-radius: 6px; font-size: 14px; font-weight: 600; cursor: pointer; transition: background 0.2s; flex: 1; }
+    #optimizeBtn { background: #0070f3; }
+    #optimizeBtn:hover { background: #0051cb; }
+    #copyBtn { background: #28a745; display: none; }
+    #copyBtn:hover { background: #218838; }
+    .metric { font-size: 14px; margin: 6px 0; display: flex; justify-content: space-between; border-bottom: 1px dashed #eee; padding-bottom: 4px; }
+    .metric span:last-child { font-family: monospace; font-weight: bold; }
+    .alert { background: #fff3cd; border: 1px solid #ffeeba; color: #856404; padding: 10px; border-radius: 4px; margin-top: 10px; font-size: 13px; display: none; }
+    #visualizer { background: white; border: 1px solid #ddd; padding: 15px; border-radius: 6px; line-height: 1.6; font-family: monospace; white-space: pre-wrap; font-size: 14px; margin-top: 20px; box-shadow: inset 0 1px 3px rgba(0,0,0,0.03); max-height: 350px; overflow-y: auto; }
+    .token-span { display: inline-block; padding: 0 1px; border-radius: 2px; margin: 1px 0; }
+    .truncated { background: #ffebee !important; border: 1px dashed #c62828; color: #b71c1c; opacity: 0.5; text-decoration: line-through; }
+    .protected-info { font-size: 12px; color: #555; margin-top: 4px; font-style: italic; }
+  </style>
+</head>
+<body>
+
+  <h2>Budget Optimizer with Syntax Protection (C3 + WASM)</h2>
+  <p>Analyzes code at native speed and trims oversized prompts while preserving structural boundaries (`}` or `;`).</p>
+  
+  <div class="grid">
+    <div>
+      <label for="inputText">Source code or development prompt:</label>
+      <textarea id="inputText">module server;
+
+async fn void init_api() {
+    const port = 8080;
+    let retries = 3;
+    while (retries > 0) {
+        if (port === 8080 && true) {
+            log_status();
+            return => port;
+        }
+        retries -= 1;
+    }
+}</textarea>
+      
+      <div class="btn-group">
+        <button id="optimizeBtn">Analyze with C3</button>
+        <button id="copyBtn">Copy Optimized Code</button>
+      </div>
+    </div>
+
+    <div class="panel">
+      <div>
+        <h3>Budget Settings</h3>
+        <div class="control-group">
+          <label for="modelSelect">Target model:</label>
+          <select id="modelSelect">
+            <option value="gpt4o-mini">GPT-4o mini ($0.15 / M tokens)</option>
+            <option value="gpt4o">GPT-4o ($2.50 / M tokens)</option>
+            <option value="claude-sonnet">Claude 3.5 Sonnet ($3.00 / M tokens)</option>
+            <option value="llama3-70b">Llama 3 ($0.59 / M tokens)</option>
+          </select>
+        </div>
+
+        <div class="control-group">
+          <label for="budgetLimit">Maximum Budget (USD):</label>
+          <input type="number" id="budgetLimit" value="0.000010" step="0.000001" min="0.000001">
+        </div>
+      </div>
+
+      <div>
+        <div class="metric"><span>Total Tokens:</span><span id="stat-tokens">0</span></div>
+        <div class="metric"><span>Original Cost:</span><span id="stat-cost">$0.000000</span></div>
+        <div class="metric"><span>Budget Limit:</span><span id="stat-allowed">0</span></div>
+        <div class="metric"><span>Final Tokens:</span><span id="stat-final">0</span></div>
+        <div class="protected-info" id="protected-msg"></div>
+        <div class="alert" id="budgetAlert"></div>
+      </div>
+    </div>
+  </div>
+
+  <h3>Token Fragmentation Map Analyzed by C3:</h3>
+  <div id="visualizer">Press the button to process the input...</div>
+
+  <script>
+    let wasmInstance = null;
+    let optimizedTextBuffer = ""; 
+    const colors = ['#FFD1DC', '#C1E1C1', '#B3E5FC', '#F0F4C3', '#FFE0B2', '#E1BEE7', '#FFCDD2', '#D1C4E9', '#C8E6C9', '#B2DFDB'];
+
+    const modelRates = { 'gpt4o-mini': 0.15, 'gpt4o': 2.50, 'claude-sonnet': 3.00, 'llama3-70b': 0.59 };
+
+    fetch('tokenizer.wasm')
+      .then(res => res.arrayBuffer())
+      .then(bytes => WebAssembly.instantiate(bytes, {}))
+      .then(({ instance }) => { wasmInstance = instance; console.log("C3 WASM engine attached."); })
+      .catch(err => console.error("Failed to initialize WASM:", err));
+
+    document.getElementById('optimizeBtn').onclick = () => {
+      if (!wasmInstance) return alert("WASM not loaded.");
+
+      const text = document.getElementById('inputText').value;
+      if (!text) return;
+
+      const encoder = new TextEncoder();
+      const encodedText = encoder.encode(text);
+      const textLen = encodedText.length;
+
+      const wasmMemory = wasmInstance.exports.memory.buffer;
+      new Uint8Array(wasmMemory).set(encodedText, 0);
+
+      const totalTokens = wasmInstance.exports.tokenize_input_text(0, textLen);
+      const outputPointer = wasmInstance.exports.get_token_output_pointer();
+      const tokenIds = Array.from(new Uint16Array(wasmMemory, outputPointer, totalTokens));
+
+      const selectedModel = document.getElementById('modelSelect').value;
+      const ratePerMillion = modelRates[selectedModel];
+      const maxBudget = parseFloat(document.getElementById('budgetLimit').value);
+      
+      const estimatedCost = (totalTokens / 1000000) * ratePerMillion;
+      let allowedTokensCount = Math.floor((maxBudget / ratePerMillion) * 1000000);
+
+      document.getElementById('stat-tokens').innerText = totalTokens;
+      document.getElementById('stat-cost').innerText = `$${estimatedCost.toFixed(6)}`;
+      document.getElementById('stat-allowed').innerText = allowedTokensCount;
+
+      let textIndex = 0;
+      const decoder = new TextDecoder();
+      let tokensObjects = [];
+
+      for (let t = 0; t < totalTokens; t++) {
+        const id = tokenIds[t];
+        let bytesConsumed = 1;
+        let tokenString = "";
+
+        if (id >= 3002 && id <= 3008) { 
+          bytesConsumed = id - 3000; 
+        } else if (id === 4001 || id === 4002 || id === 4003) { 
+          bytesConsumed = 3; 
+        } else if ((id >= 4101 && id <= 4110) || id === 101 || id === 102 || id === 103 || id === 104 || id === 105 || id === 106 || id === 107 || id === 108) { 
+          bytesConsumed = 2; 
+        } else if (id >= 5001 && id <= 5015) {
+          const keywords = {
+            5001:"const", 5002:"return", 5003:"function", 5004:"if", 5005:"else", 
+            5006:"let", 5007:"void", 5008:"while", 5009:"import", 5010:"export",
+            5011:"async", 5012:"await", 5013:"class", 5014:"fn", 5015:"module"
+          };
+          tokenString = keywords[id];
+          bytesConsumed = tokenString.length;
+        } else if (id >= 20000) {
+          const firstByte = encodedText[textIndex];
+          if ((firstByte & 0xE0) === 0xC0) { bytesConsumed = 2; }
+          else if ((firstByte & 0xF0) === 0xE0) { bytesConsumed = 3; }
+          else if ((firstByte & 0xF8) === 0xF0) { bytesConsumed = 4; }
+        }
+
+        if (!tokenString) {
+          const slice = encodedText.slice(textIndex, textIndex + bytesConsumed);
+          tokenString = decoder.decode(slice);
+        }
+
+        tokensObjects.push({ id, str: tokenString, index: t });
+        textIndex += bytesConsumed;
+      }
+
+      let finalCutoffIndex = allowedTokensCount;
+      let protectedBySyntax = false;
+
+      if (totalTokens > allowedTokensCount) {
+        let safeIndex = -1;
+        for (let i = allowedTokensCount - 1; i >= 0; i--) {
+          const tokenStr = tokensObjects[i].str.trim();
+          if (tokenStr === '}' || tokenStr === ';') {
+            safeIndex = i + 1; 
+            break;
+          }
+        }
+        if (safeIndex !== -1 && safeIndex < allowedTokensCount) {
+          finalCutoffIndex = safeIndex;
+          protectedBySyntax = true;
+        }
+      } else {
+        finalCutoffIndex = totalTokens;
+      }
+
+      document.getElementById('stat-final').innerText = finalCutoffIndex;
+      const msgBox = document.getElementById('protected-msg');
+      msgBox.innerText = protectedBySyntax 
+        ? `Syntax-aware adjustment: trimmed at a brace or semicolon to avoid breaking the code.`
+        : (totalTokens > allowedTokensCount ? `Strictly trimmed at the budget limit.` : ``);
+
+      const alertBox = document.getElementById('budgetAlert');
+      if (totalTokens > allowedTokensCount) {
+        alertBox.style.display = 'block';
+        alertBox.innerHTML = `Budget exceeded. <b>${finalCutoffIndex}</b> tokens were preserved safely.`;
+      } else {
+        alertBox.style.display = 'none';
+      }
+
+      const visualizer = document.getElementById('visualizer');
+      visualizer.innerHTML = ''; 
+      optimizedTextBuffer = "";
+
+      tokensObjects.forEach((token, idx) => {
+        const span = document.createElement('span');
+        span.className = 'token-span';
+        span.textContent = token.str;
+        span.title = `Token ID: ${token.id}`;
+
+        if (idx >= finalCutoffIndex) {
+          span.className += ' truncated';
+          span.title += " (Excluded by syntax protection)";
+        } else {
+          span.style.backgroundColor = colors[token.id % colors.length];
+          optimizedTextBuffer += token.str; 
+        }
+        visualizer.appendChild(span);
+      });
+
+      document.getElementById('copyBtn').style.display = 'block';
+    };
+
+    document.getElementById('copyBtn').onclick = () => {
+      if (!optimizedTextBuffer) return;
+      navigator.clipboard.writeText(optimizedTextBuffer).then(() => {
+        const btn = document.getElementById('copyBtn');
+        const oldText = btn.innerText;
+        btn.innerText = "Copied Successfully! ✓";
+        btn.style.backgroundColor = "#155724";
+        setTimeout(() => {
+          btn.innerText = oldText;
+          btn.style.backgroundColor = "#28a745";
+        }, 2000);
+      }).catch(err => alert("Failed to copy to clipboard: " + err));
+    };
+  </script>
+</body>
+</html>
